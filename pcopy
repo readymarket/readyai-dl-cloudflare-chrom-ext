@@ -1,0 +1,787 @@
+<documents>
+<document index="1">
+<source>./background.js</source>
+<document_content>
+// 監聽來自 content script 的消息
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'download') {
+    // 建立 Blob 並下載
+    const blob = new Blob([message.content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    
+    chrome.downloads.download({
+      url: url,
+      filename: message.filename,
+      saveAs: true
+    }, () => {
+      URL.revokeObjectURL(url);
+      // 只有完整下載才發送完成訊息
+      if (!message.isPartial) {
+        chrome.runtime.sendMessage({
+          type: 'complete',
+          novelId: message.novelId
+        });
+      }
+    });
+  }
+});
+
+// 監聽安裝事件
+chrome.runtime.onInstalled.addListener(() => {
+  // 清除所有已存儲的進度
+  chrome.storage.local.clear();
+});
+
+</document_content>
+</document>
+<document index="2">
+<source>./content.js</source>
+<document_content>
+// 隨機延遲函數
+function delay(min, max) {
+  const ms = Math.random() * (max - min) + min;
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 檢查是否有 Cloudflare 驗證
+function hasCloudflareChallenge() {
+  return document.querySelector('#challenge-form') !== null;
+}
+
+// 獲取小說標題
+function getNovelTitle() {
+  const titleElement = document.querySelector('span.title');
+  if (!titleElement) throw new Error('無法找到小說標題');
+  return titleElement.textContent.trim();
+}
+
+// 獲取章節列表
+function getChapterList() {
+  const chapterList = document.querySelector('ul.nav.chapter-list');
+  if (!chapterList) throw new Error('無法找到章節列表');
+  
+  return Array.from(chapterList.querySelectorAll('a')).map(a => ({
+    url: a.href,
+    title: a.textContent.trim()
+  }));
+}
+
+// 獲取章節內容
+async function getChapterContent(url) {
+  try {
+    const response = await fetch(url);
+    const text = await response.text();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(text, 'text/html');
+    
+    if (hasCloudflareChallenge()) {
+      throw new Error('遇到 Cloudflare 驗證，請稍後再試');
+    }
+
+    const content = doc.querySelector('div.content');
+    if (!content) throw new Error('無法找到章節內容');
+    
+    return content.textContent.trim();
+  } catch (error) {
+    throw new Error(`獲取章節內容失敗: ${error.message}`);
+  }
+}
+
+// 監聽來自 popup 的消息
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === 'startDownload') {
+    startNovelDownload();
+  }
+});
+
+// 保存下載進度
+async function saveProgress(novelId, title, downloadedChapters, content) {
+  await chrome.storage.local.set({
+    [`novel_${novelId}`]: {
+      title,
+      downloadedChapters,
+      content,
+      lastUpdate: Date.now()
+    }
+  });
+}
+
+// 獲取已保存的進度
+async function getProgress(novelId) {
+  const result = await chrome.storage.local.get(`novel_${novelId}`);
+  return result[`novel_${novelId}`];
+}
+
+// 從URL獲取小說ID
+function getNovelId() {
+  const match = location.pathname.match(/\/n\/([\w-]+)/);
+  return match ? match[1] : null;
+}
+
+// 開始下載小說
+async function startNovelDownload() {
+  try {
+    if (hasCloudflareChallenge()) {
+      throw new Error('請先通過 Cloudflare 驗證');
+    }
+
+    const novelId = getNovelId();
+    const title = getNovelTitle();
+    const chapters = getChapterList();
+    
+    // 檢查是否有保存的進度
+    let savedProgress = await getProgress(novelId);
+    let content = savedProgress?.content || `${title}\n\n`;
+    let downloadedChapters = savedProgress?.downloadedChapters || [];
+    
+    // 更新進度顯示
+    const updateProgress = (current, total) => {
+      const progress = Math.floor((current / total) * 100);
+      chrome.runtime.sendMessage({
+        type: 'progress',
+        value: progress,
+        current: current + 1,
+        total: total,
+        novelId: novelId
+      });
+    };
+
+    // 從上次的進度繼續下載
+    for (let i = downloadedChapters.length; i < chapters.length; i++) {
+      const chapter = chapters[i];
+      
+      updateProgress(i, chapters.length);
+      
+      chrome.runtime.sendMessage({
+        type: 'status',
+        text: `正在下載: ${chapter.title}`,
+        novelId: novelId
+      });
+
+      // 加入隨機延遲，避免觸發 Cloudflare 驗證
+      await delay(2000, 4000);
+      
+      try {
+        const chapterContent = await getChapterContent(chapter.url);
+        content += `\n\n${chapter.title}\n\n${chapterContent}`;
+        downloadedChapters.push(chapter.url);
+        
+        // 每下載一章就保存進度
+        await saveProgress(novelId, title, downloadedChapters, content);
+
+        // 發送目前內容給 background script
+        chrome.runtime.sendMessage({
+          type: 'contentUpdate',
+          content: content,
+          title: title,
+          novelId: novelId,
+          isPartial: true
+        });
+      } catch (error) {
+        console.error(`下載章節失敗: ${chapter.title}`, error);
+        // 保存當前進度，下次可以從這裡繼續
+        await saveProgress(novelId, title, downloadedChapters, content);
+        throw error;
+      }
+    }
+
+    // 下載完成，發送內容給 background script 處理下載
+    chrome.runtime.sendMessage({
+      type: 'download',
+      content: content,
+      filename: `${title}.txt`,
+      novelId: novelId,
+      isPartial: false
+    });
+
+    // 下載完成後清除進度
+    await chrome.storage.local.remove(`novel_${novelId}`);
+
+  } catch (error) {
+    chrome.runtime.sendMessage({
+      type: 'error',
+      error: error.message
+    });
+  }
+}
+
+// 儲存目前進度
+async function saveCurrentProgress() {
+  try {
+    const novelId = getNovelId();
+    const savedProgress = await getProgress(novelId);
+    
+    if (!savedProgress || !savedProgress.content) {
+      throw new Error('沒有可以儲存的進度');
+    }
+
+    chrome.runtime.sendMessage({
+      type: 'download',
+      content: savedProgress.content,
+      filename: `${savedProgress.title}_部分.txt`,
+      novelId: novelId,
+      isPartial: true
+    });
+
+  } catch (error) {
+    chrome.runtime.sendMessage({
+      type: 'error',
+      error: error.message
+    });
+  }
+}
+
+</document_content>
+</document>
+<document index="3">
+<source>./manifest.json</source>
+<document_content>
+{
+  "manifest_version": 3,
+  "name": "CZBooks 小說下載器",
+  "version": "1.0",
+  "description": "自動下載 czbooks.net 小說內容",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://czbooks.net/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://czbooks.net/n/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
+</document_content>
+</document>
+<document index="4">
+<source>./pcopy</source>
+<document_content>
+<documents>
+<document index="1">
+<source>./background.js</source>
+<document_content>
+// 監聽來自 content script 的消息
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'download') {
+    // 建立 Blob 並下載
+    const blob = new Blob([message.content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    
+    chrome.downloads.download({
+      url: url,
+      filename: message.filename,
+      saveAs: true
+    }, () => {
+      URL.revokeObjectURL(url);
+      // 只有完整下載才發送完成訊息
+      if (!message.isPartial) {
+        chrome.runtime.sendMessage({
+          type: 'complete',
+          novelId: message.novelId
+        });
+      }
+    });
+  }
+});
+
+// 監聽安裝事件
+chrome.runtime.onInstalled.addListener(() => {
+  // 清除所有已存儲的進度
+  chrome.storage.local.clear();
+});
+
+</document_content>
+</document>
+<document index="2">
+<source>./content.js</source>
+<document_content>
+// 隨機延遲函數
+function delay(min, max) {
+  const ms = Math.random() * (max - min) + min;
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 檢查是否有 Cloudflare 驗證
+function hasCloudflareChallenge() {
+  return document.querySelector('#challenge-form') !== null;
+}
+
+// 獲取小說標題
+function getNovelTitle() {
+  const titleElement = document.querySelector('span.title');
+  if (!titleElement) throw new Error('無法找到小說標題');
+  return titleElement.textContent.trim();
+}
+
+// 獲取章節列表
+function getChapterList() {
+  const chapterList = document.querySelector('ul.nav.chapter-list');
+  if (!chapterList) throw new Error('無法找到章節列表');
+  
+  return Array.from(chapterList.querySelectorAll('a')).map(a => ({
+    url: a.href,
+    title: a.textContent.trim()
+  }));
+}
+
+// 獲取章節內容
+async function getChapterContent(url) {
+  try {
+    const response = await fetch(url);
+    const text = await response.text();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(text, 'text/html');
+    
+    if (hasCloudflareChallenge()) {
+      throw new Error('遇到 Cloudflare 驗證，請稍後再試');
+    }
+
+    const content = doc.querySelector('div.content');
+    if (!content) throw new Error('無法找到章節內容');
+    
+    return content.textContent.trim();
+  } catch (error) {
+    throw new Error(`獲取章節內容失敗: ${error.message}`);
+  }
+}
+
+// 監聽來自 popup 的消息
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === 'startDownload') {
+    startNovelDownload();
+  }
+});
+
+// 保存下載進度
+async function saveProgress(novelId, title, downloadedChapters, content) {
+  await chrome.storage.local.set({
+    [`novel_${novelId}`]: {
+      title,
+      downloadedChapters,
+      content,
+      lastUpdate: Date.now()
+    }
+  });
+}
+
+// 獲取已保存的進度
+async function getProgress(novelId) {
+  const result = await chrome.storage.local.get(`novel_${novelId}`);
+  return result[`novel_${novelId}`];
+}
+
+// 從URL獲取小說ID
+function getNovelId() {
+  const match = location.pathname.match(/\/n\/([\w-]+)/);
+  return match ? match[1] : null;
+}
+
+// 開始下載小說
+async function startNovelDownload() {
+  try {
+    if (hasCloudflareChallenge()) {
+      throw new Error('請先通過 Cloudflare 驗證');
+    }
+
+    const novelId = getNovelId();
+    const title = getNovelTitle();
+    const chapters = getChapterList();
+    
+    // 檢查是否有保存的進度
+    let savedProgress = await getProgress(novelId);
+    let content = savedProgress?.content || `${title}\n\n`;
+    let downloadedChapters = savedProgress?.downloadedChapters || [];
+    
+    // 更新進度顯示
+    const updateProgress = (current, total) => {
+      const progress = Math.floor((current / total) * 100);
+      chrome.runtime.sendMessage({
+        type: 'progress',
+        value: progress,
+        current: current + 1,
+        total: total,
+        novelId: novelId
+      });
+    };
+
+    // 從上次的進度繼續下載
+    for (let i = downloadedChapters.length; i < chapters.length; i++) {
+      const chapter = chapters[i];
+      
+      updateProgress(i, chapters.length);
+      
+      chrome.runtime.sendMessage({
+        type: 'status',
+        text: `正在下載: ${chapter.title}`,
+        novelId: novelId
+      });
+
+      // 加入隨機延遲，避免觸發 Cloudflare 驗證
+      await delay(2000, 4000);
+      
+      try {
+        const chapterContent = await getChapterContent(chapter.url);
+        content += `\n\n${chapter.title}\n\n${chapterContent}`;
+        downloadedChapters.push(chapter.url);
+        
+        // 每下載一章就保存進度
+        await saveProgress(novelId, title, downloadedChapters, content);
+
+        // 發送目前內容給 background script
+        chrome.runtime.sendMessage({
+          type: 'contentUpdate',
+          content: content,
+          title: title,
+          novelId: novelId,
+          isPartial: true
+        });
+      } catch (error) {
+        console.error(`下載章節失敗: ${chapter.title}`, error);
+        // 保存當前進度，下次可以從這裡繼續
+        await saveProgress(novelId, title, downloadedChapters, content);
+        throw error;
+      }
+    }
+
+    // 下載完成，發送內容給 background script 處理下載
+    chrome.runtime.sendMessage({
+      type: 'download',
+      content: content,
+      filename: `${title}.txt`,
+      novelId: novelId,
+      isPartial: false
+    });
+
+    // 下載完成後清除進度
+    await chrome.storage.local.remove(`novel_${novelId}`);
+
+  } catch (error) {
+    chrome.runtime.sendMessage({
+      type: 'error',
+      error: error.message
+    });
+  }
+}
+
+// 儲存目前進度
+async function saveCurrentProgress() {
+  try {
+    const novelId = getNovelId();
+    const savedProgress = await getProgress(novelId);
+    
+    if (!savedProgress || !savedProgress.content) {
+      throw new Error('沒有可以儲存的進度');
+    }
+
+    chrome.runtime.sendMessage({
+      type: 'download',
+      content: savedProgress.content,
+      filename: `${savedProgress.title}_部分.txt`,
+      novelId: novelId,
+      isPartial: true
+    });
+
+  } catch (error) {
+    chrome.runtime.sendMessage({
+      type: 'error',
+      error: error.message
+    });
+  }
+}
+
+</document_content>
+</document>
+<document index="3">
+<source>./manifest.json</source>
+<document_content>
+{
+  "manifest_version": 3,
+  "name": "CZBooks 小說下載器",
+  "version": "1.0",
+  "description": "自動下載 czbooks.net 小說內容",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://czbooks.net/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://czbooks.net/n/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
+</document_content>
+</document>
+</document_content>
+</document>
+<document index="5">
+<source>./popup.html</source>
+<document_content>
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 300px;
+      padding: 10px;
+      font-family: Arial, sans-serif;
+    }
+    .button-group {
+      display: flex;
+      gap: 5px;
+    }
+    button {
+      flex: 1;
+      padding: 8px;
+      margin: 5px 0;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    #downloadBtn {
+      background-color: #4CAF50;
+    }
+    #downloadBtn:hover {
+      background-color: #45a049;
+    }
+    #saveBtn {
+      background-color: #2196F3;
+    }
+    #saveBtn:hover {
+      background-color: #1976D2;
+    }
+    #status {
+      margin-top: 10px;
+      padding: 10px;
+      border-radius: 4px;
+    }
+    .success {
+      background-color: #dff0d8;
+      color: #3c763d;
+    }
+    .error {
+      background-color: #f2dede;
+      color: #a94442;
+    }
+    .progress {
+      margin-top: 10px;
+      display: none;
+    }
+    .progress-info {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 5px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h2>CZBooks 小說下載器</h2>
+  <div class="button-group">
+    <button id="downloadBtn">開始下載</button>
+    <button id="saveBtn" disabled>儲存目前進度</button>
+  </div>
+  <div id="status"></div>
+  <div class="progress">
+    <progress id="progressBar" value="0" max="100"></progress>
+    <div class="progress-info">
+      <span id="progressText">0%</span>
+      <span id="chapterInfo"></span>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
+</document_content>
+</document>
+<document index="6">
+<source>./popup.js</source>
+<document_content>
+// 獲取當前頁面的小說id
+async function getCurrentNovelId() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const match = tab.url.match(/\/n\/(([\w-]+))/);
+  return match ? match[1] : null;
+}
+
+// 更新UI狀態
+function updateUIState(downloadBtn, status, progress, progressBar, progressText, state) {
+  if (state.downloading) {
+    downloadBtn.disabled = true;
+    progress.style.display = 'block';
+    if (state.progressValue !== undefined) {
+      progressBar.value = state.progressValue;
+      progressText.textContent = `${state.progressValue}%`;
+    }
+    if (state.statusText) {
+      status.textContent = state.statusText;
+      status.className = state.statusClass || '';
+    }
+  } else {
+    downloadBtn.disabled = false;
+    progress.style.display = 'none';
+    status.textContent = '';
+    status.className = '';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', async function() {
+  const downloadBtn = document.getElementById('downloadBtn');
+  const saveBtn = document.getElementById('saveBtn');
+  const status = document.getElementById('status');
+  const progress = document.querySelector('.progress');
+  const progressBar = document.getElementById('progressBar');
+  const progressText = document.getElementById('progressText');
+  const chapterInfo = document.getElementById('chapterInfo');
+
+  // 獲取當前小說的下載狀態
+  const novelId = await getCurrentNovelId();
+  if (novelId) {
+    const result = await chrome.storage.local.get(`novel_${novelId}`);
+    const savedProgress = result[`novel_${novelId}`];
+    if (savedProgress) {
+      updateUIState(downloadBtn, saveBtn, status, progress, progressBar, progressText, chapterInfo, {
+        downloading: true,
+        progressValue: 0,
+        statusText: '已有下載進度，點擊開始繼續下載',
+        enableSave: true
+      });
+    }
+  }
+
+  downloadBtn.addEventListener('click', async () => {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      
+      if (!tab.url.startsWith('https://czbooks.net/n/')) {
+        throw new Error('請在 czbooks.net 的小說頁面使用此擴充功能');
+      }
+
+      updateUIState(downloadBtn, saveBtn, status, progress, progressBar, progressText, chapterInfo, {
+        downloading: true,
+        statusText: '正在準備下載...',
+        enableSave: false
+      });
+
+      // 發送消息給 content script 開始下載
+      chrome.tabs.sendMessage(tab.id, { action: 'startDownload' });
+    } catch (error) {
+      updateUIState(downloadBtn, saveBtn, status, progress, progressBar, progressText, chapterInfo, {
+        downloading: false,
+        statusText: error.message,
+        statusClass: 'error',
+        enableSave: false
+      });
+    }
+  });
+
+  saveBtn.addEventListener('click', async () => {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      chrome.tabs.sendMessage(tab.id, { action: 'saveProgress' });
+    } catch (error) {
+      updateUIState(downloadBtn, saveBtn, status, progress, progressBar, progressText, chapterInfo, {
+        downloading: false,
+        statusText: error.message,
+        statusClass: 'error',
+        enableSave: false
+      });
+    }
+  });
+
+  // 監聽來自 background script 的消息
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'progress' && message.novelId === novelId) {
+      updateUIState(downloadBtn, saveBtn, status, progress, progressBar, progressText, chapterInfo, {
+        downloading: true,
+        progressValue: message.value,
+        enableSave: true,
+        chapterInfo: `${message.current}/${message.total}`
+      });
+    } else if (message.type === 'status' && message.novelId === novelId) {
+      updateUIState(downloadBtn, saveBtn, status, progress, progressBar, progressText, chapterInfo, {
+        downloading: true,
+        statusText: message.text,
+        statusClass: message.class,
+        enableSave: true
+      });
+    } else if (message.type === 'complete' && message.novelId === novelId) {
+      updateUIState(downloadBtn, saveBtn, status, progress, progressBar, progressText, chapterInfo, {
+        downloading: false,
+        statusText: '下載完成！',
+        statusClass: 'success',
+        enableSave: false
+      });
+    } else if (message.type === 'error') {
+      updateUIState(downloadBtn, saveBtn, status, progress, progressBar, progressText, chapterInfo, {
+        downloading: false,
+        statusText: message.error,
+        statusClass: 'error',
+        enableSave: true
+      });
+    }
+  });
+});
+
+// 更新UI狀態
+function updateUIState(downloadBtn, saveBtn, status, progress, progressBar, progressText, chapterInfo, state) {
+  if (state.downloading) {
+    downloadBtn.disabled = true;
+    progress.style.display = 'block';
+    if (state.progressValue !== undefined) {
+      progressBar.value = state.progressValue;
+      progressText.textContent = `${state.progressValue}%`;
+    }
+    if (state.statusText) {
+      status.textContent = state.statusText;
+      status.className = state.statusClass || '';
+    }
+    if (state.chapterInfo) {
+      chapterInfo.textContent = state.chapterInfo;
+    }
+  } else {
+    downloadBtn.disabled = false;
+    progress.style.display = 'none';
+    if (state.statusText) {
+      status.textContent = state.statusText;
+      status.className = state.statusClass || '';
+    } else {
+      status.textContent = '';
+      status.className = '';
+    }
+  }
+  
+  saveBtn.disabled = !state.enableSave;
+}
+</document_content>
+</document>
+</documents>

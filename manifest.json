@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "CZBooks 小說下載器",
+  "version": "1.0",
+  "description": "自動下載 czbooks.net 小說內容",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://czbooks.net/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://czbooks.net/n/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

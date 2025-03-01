@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 300px;
+      padding: 10px;
+      font-family: Arial, sans-serif;
+    }
+    .button-group {
+      display: flex;
+      gap: 5px;
+    }
+    button {
+      flex: 1;
+      padding: 8px;
+      margin: 5px 0;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    #downloadBtn {
+      background-color: #4CAF50;
+    }
+    #downloadBtn:hover {
+      background-color: #45a049;
+    }
+    #saveBtn {
+      background-color: #2196F3;
+    }
+    #saveBtn:hover {
+      background-color: #1976D2;
+    }
+    #status {
+      margin-top: 10px;
+      padding: 10px;
+      border-radius: 4px;
+    }
+    .success {
+      background-color: #dff0d8;
+      color: #3c763d;
+    }
+    .error {
+      background-color: #f2dede;
+      color: #a94442;
+    }
+    .progress {
+      margin-top: 10px;
+      display: none;
+    }
+    .progress-info {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 5px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h2>CZBooks 小說下載器</h2>
+  <div class="button-group">
+    <button id="downloadBtn">開始下載</button>
+    <button id="saveBtn" disabled>儲存目前進度</button>
+  </div>
+  <div id="status"></div>
+  <div class="progress">
+    <progress id="progressBar" value="0" max="100"></progress>
+    <div class="progress-info">
+      <span id="progressText">0%</span>
+      <span id="chapterInfo"></span>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
