@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "CZBooks 小說下載器",
+  "name": "網頁內容下載器",
   "version": "1.0",
-  "description": "自動下載 czbooks.net 小說內容",
+  "description": "批量下載網頁內容並轉換為 XML 格式",
   "permissions": [
     "activeTab",
     "storage",
@@ -10,14 +10,12 @@
     "downloads"
   ],
   "host_permissions": [
-    "https://czbooks.net/*"
+    "<all_urls>"
   ],
-  "action": {
-    "default_popup": "popup.html"
-  },
+  "devtools_page": "devtools/devtools.html",
   "content_scripts": [
     {
-      "matches": ["https://czbooks.net/n/*"],
+      "matches": ["<all_urls>"],
       "js": ["content.js"]
     }
   ],
